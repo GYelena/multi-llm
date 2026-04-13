@@ -1,0 +1,25 @@
+# Python 缓存和环境
+__pycache__/
+*.py[cod]
+venv/
+.env
+
+# 实验数据与传统模型权重
+*.pth
+*.pt
+*.h5
+data/
+datasets/
+logs/
+
+# 🎯 新增：现代大模型权重格式
+*.safetensors
+*.bin
+
+# 🎯 新增：直接屏蔽你当前的大模型和输出文件夹
+DeepSeek-R1/
+Data/
+
+# 编辑器配置
+.vscode/
+.cursor/
