@@ -1,0 +1,2 @@
+{"id": "exp_a_fin_001", "domain": "finance", "expert": "A", "nodeId": "T1", "taskType": "retrieve", "query": "解释复利与单利的区别，并各举一个简单数字例子。", "context": {}, "assistant": "单利：利息仅按本金计算。复利：利息计入本金再计息。例：本金100、年利率10%：单利一年利息10；复利一年本息110。"}
+{"id": "exp_b_math_001", "domain": "math", "expert": "B", "nodeId": "T1", "taskType": "reason", "query": "解方程：3x + 7 = 22，写出 x 的值。", "context": {}, "assistant": "步骤：3x+7=22 → 3x=15 → x=5。检验：3*5+7=22。"}
