@@ -19,6 +19,7 @@ logs/
 # 🎯 新增：直接屏蔽你当前的大模型和输出文件夹
 DeepSeek-R1/
 Data/
+models/
 
 # 编辑器配置
 .vscode/

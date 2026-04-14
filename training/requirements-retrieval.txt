@@ -1,0 +1,5 @@
+# Expert A RAG retrieval (train_retrieval_biencoder.py)
+torch>=2.1.0
+transformers>=4.40.0
+tqdm>=4.66.0
+huggingface_hub>=0.23.0

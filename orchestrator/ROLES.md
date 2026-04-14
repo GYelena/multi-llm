@@ -49,6 +49,15 @@
 
 ## 2. 专家 A / B / C（执行节点）
 
+### 专家 A 的两条训练线（不要混用数据）
+
+| 能力 | 数据 | 训练方式 |
+|------|------|----------|
+| **RAG 检索**（双塔：query / passage 向量） | `Data/Processed_data/A_retrieval.jsonl` | `training/train_retrieval_biencoder.py`；英文语料默认 `BAAI/bge-base-en-v1.5`；大因果模型（如 DeepSeek-R1）仅作可选；检索与 B/C 生成解耦是常见做法。 |
+| **RAG 生成**（读 passages 再写答案） | `A_generation.jsonl` | 与 B/C 相同：`training/train_lora_sft.py`（因果 LM LoRA）。 |
+
+编排里 Expert A 的 `retrieve` 节点在线上是「调用检索服务」；离线训检索模型请走 **A_retrieval**，不要拿 **A_generation** 当检索数据。
+
 ### 与代码一致的 system prompt（OpenAI 适配器）
 
 - **A**：`You are Expert A (factual retrieval and grounding). Return concise evidence-oriented results.`
