@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import socket
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from .protocol import ExpertRequest, ExpertResponse
 
@@ -117,32 +118,100 @@ class OpenAIExpertAdapter(BaseExpertAdapter):
 
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+                raw_body = resp.read().decode("utf-8", errors="replace")
+                try:
+                    data = json.loads(raw_body)
+                except json.JSONDecodeError:
+                    return ExpertResponse(
+                        node_id=request.node.node_id,
+                        summary="remote expert returned invalid JSON payload",
+                        confidence=0.0,
+                        payload={"rawBody": raw_body[:2000]},
+                        error_code="invalid_upstream_json",
+                    )
         except urllib.error.HTTPError as e:
             return ExpertResponse(
                 node_id=request.node.node_id,
                 summary="remote expert call failed",
                 confidence=0.0,
                 payload={},
-                error_code=f"http_{e.code}",
+                error_code=self._classify_http_error(e.code),
             )
-        except Exception:
+        except urllib.error.URLError as e:
+            reason = str(getattr(e, "reason", "")).lower()
+            if "timed out" in reason:
+                code = "network_timeout"
+            elif "refused" in reason:
+                code = "connection_refused"
+            elif "name or service not known" in reason or "temporary failure in name resolution" in reason:
+                code = "dns_resolution_failed"
+            else:
+                code = "network_error"
+            return ExpertResponse(
+                node_id=request.node.node_id,
+                summary="remote expert network error",
+                confidence=0.0,
+                payload={"reason": str(getattr(e, "reason", ""))},
+                error_code=code,
+            )
+        except (TimeoutError, socket.timeout):
+            return ExpertResponse(
+                node_id=request.node.node_id,
+                summary="remote expert timeout",
+                confidence=0.0,
+                payload={},
+                error_code="network_timeout",
+            )
+        except Exception as e:
             return ExpertResponse(
                 node_id=request.node.node_id,
                 summary="remote expert call exception",
                 confidence=0.0,
-                payload={},
+                payload={"exception": str(e)},
                 error_code="call_exception",
             )
 
         text = self._extract_text(data)
-        confidence = 0.70 if text else 0.0
+        if not text:
+            return ExpertResponse(
+                node_id=request.node.node_id,
+                summary=f"expert {self.expert_name} returned empty content",
+                confidence=0.0,
+                payload={"raw": data},
+                error_code="empty_response",
+            )
+
+        payload, parse_error = self._parse_structured_payload(text)
+        if parse_error is not None:
+            repaired_payload, repair_error = self._repair_structured_payload(
+                url=url,
+                request=request,
+                raw_text=text,
+            )
+            if repair_error is None and repaired_payload is not None:
+                confidence = self._pick_confidence(repaired_payload)
+                return ExpertResponse(
+                    node_id=request.node.node_id,
+                    summary=f"expert {self.expert_name} completed after repair_once",
+                    confidence=confidence,
+                    payload=repaired_payload,
+                    error_code=None,
+                )
+            return ExpertResponse(
+                node_id=request.node.node_id,
+                summary=f"expert {self.expert_name} output is not valid structured JSON",
+                confidence=0.0,
+                payload={"rawText": text, "raw": data},
+                error_code=repair_error or parse_error,
+            )
+
+        confidence = self._pick_confidence(payload)
         return ExpertResponse(
             node_id=request.node.node_id,
             summary=f"expert {self.expert_name} completed",
             confidence=confidence,
-            payload={"text": text, "raw": data},
-            error_code=None if text else "empty_response",
+            payload=payload,
+            error_code=None,
         )
 
     def _build_user_content(self, request: ExpertRequest) -> str:
@@ -166,6 +235,186 @@ class OpenAIExpertAdapter(BaseExpertAdapter):
             return str(msg.get("content", "")).strip()
         except Exception:
             return ""
+
+    @staticmethod
+    def _classify_http_error(code: int) -> str:
+        if code == 401:
+            return "unauthorized"
+        if code == 403:
+            return "forbidden"
+        if code == 404:
+            return "endpoint_not_found"
+        if code == 408:
+            return "network_timeout"
+        if code == 422:
+            return "invalid_request"
+        if code == 429:
+            return "rate_limited"
+        if 500 <= code < 600:
+            return "upstream_server_error"
+        return f"http_{code}"
+
+    def _parse_structured_payload(self, text: str) -> Tuple[Dict[str, Any], Optional[str]]:
+        raw = self._parse_json_like_text(text)
+        if raw is None:
+            return {}, "invalid_json"
+        if not isinstance(raw, dict):
+            return {}, "invalid_schema"
+        if self.expert_name == "A":
+            if not isinstance(raw.get("claims"), list):
+                return {}, "invalid_schema"
+            if not isinstance(raw.get("sourceRefs"), list):
+                return {}, "invalid_schema"
+            citation_conf = raw.get("citationConfidence")
+            if not isinstance(citation_conf, (int, float)):
+                return {}, "invalid_schema"
+            raw["citationConfidence"] = max(0.0, min(1.0, float(citation_conf)))
+            raw.setdefault("evidences", [])
+        elif self.expert_name == "B":
+            if not isinstance(raw.get("reasoningSteps"), list):
+                return {}, "invalid_schema"
+            if not isinstance(raw.get("verifications"), list):
+                return {}, "invalid_schema"
+            if not isinstance(raw.get("checkResult"), str):
+                return {}, "invalid_schema"
+        elif self.expert_name == "C":
+            if not isinstance(raw.get("draft"), str):
+                return {}, "invalid_schema"
+            if not isinstance(raw.get("fidelityReport"), str):
+                return {}, "invalid_schema"
+            if not isinstance(raw.get("unsupportedStatements"), list):
+                return {}, "invalid_schema"
+        else:
+            return {}, "invalid_schema"
+        return raw, None
+
+    @staticmethod
+    def _parse_json_like_text(text: str) -> Optional[Any]:
+        stripped = text.strip()
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+        if stripped.startswith("```"):
+            first_nl = stripped.find("\n")
+            last_fence = stripped.rfind("```")
+            if first_nl != -1 and last_fence > first_nl:
+                inner = stripped[first_nl + 1 : last_fence].strip()
+                try:
+                    return json.loads(inner)
+                except json.JSONDecodeError:
+                    pass
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(stripped[start : end + 1])
+            except json.JSONDecodeError:
+                return None
+        return None
+
+    def _pick_confidence(self, payload: Dict[str, Any]) -> float:
+        raw_conf = payload.get("confidence")
+        if isinstance(raw_conf, (int, float)):
+            return max(0.0, min(1.0, float(raw_conf)))
+        defaults = {"A": 0.72, "B": 0.70, "C": 0.78}
+        if self.expert_name == "A":
+            citation_conf = payload.get("citationConfidence")
+            if isinstance(citation_conf, (int, float)):
+                return max(0.0, min(1.0, float(citation_conf)))
+        return defaults.get(self.expert_name, 0.70)
+
+    def _repair_structured_payload(
+        self,
+        url: str,
+        request: ExpertRequest,
+        raw_text: str,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        body = {
+            "model": self.model,
+            "temperature": 0.0,
+            "messages": [
+                {"role": "system", "content": self._repair_system_prompt()},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "expert": self.expert_name,
+                            "nodeId": request.node.node_id,
+                            "taskType": request.node.task_type.value,
+                            "invalidOutput": raw_text,
+                            "targetSchemaHint": self._schema_hint(),
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+        }
+        req = urllib.request.Request(
+            url,
+            method="POST",
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
+                raw_body = resp.read().decode("utf-8", errors="replace")
+                try:
+                    data = json.loads(raw_body)
+                except json.JSONDecodeError:
+                    return None, "repair_invalid_upstream_json"
+        except urllib.error.HTTPError as e:
+            return None, f"repair_{self._classify_http_error(e.code)}"
+        except urllib.error.URLError as e:
+            reason = str(getattr(e, "reason", "")).lower()
+            if "timed out" in reason:
+                code = "network_timeout"
+            elif "refused" in reason:
+                code = "connection_refused"
+            elif "name or service not known" in reason or "temporary failure in name resolution" in reason:
+                code = "dns_resolution_failed"
+            else:
+                code = "network_error"
+            return None, f"repair_{code}"
+        except (TimeoutError, socket.timeout):
+            return None, "repair_network_timeout"
+        except Exception:
+            return None, "repair_call_exception"
+
+        text = self._extract_text(data)
+        if not text:
+            return None, "repair_empty_response"
+        payload, parse_error = self._parse_structured_payload(text)
+        if parse_error is not None:
+            return None, f"repair_{parse_error}"
+        return payload, None
+
+    @staticmethod
+    def _repair_system_prompt() -> str:
+        return (
+            "You are a JSON repair assistant. "
+            "Rewrite the given invalid model output into VALID JSON that strictly matches target schema hint. "
+            "Return ONLY JSON. Do not include markdown or explanations."
+        )
+
+    def _schema_hint(self) -> str:
+        if self.expert_name == "A":
+            return (
+                '{"claims": ["..."], "evidences": ["..."], "sourceRefs": ["..."], '
+                '"citationConfidence": 0.0, "confidence": 0.0}'
+            )
+        if self.expert_name == "B":
+            return (
+                '{"reasoningSteps": ["..."], "verifications": ["..."], '
+                '"checkResult": "passed|failed", "confidence": 0.0}'
+            )
+        return (
+            '{"draft": "...", "fidelityReport": "...", '
+            '"unsupportedStatements": ["..."], "confidence": 0.0}'
+        )
 
 
 class ExpertRegistry:
@@ -208,7 +457,8 @@ def build_openai_registry(
                 timeout_seconds=timeout_seconds,
                 system_prompt=(
                     "You are Expert A (factual retrieval and grounding). "
-                    "Return concise evidence-oriented results."
+                    "Return ONLY valid JSON with keys: claims (list[str]), evidences (list[str]), "
+                    "sourceRefs (list[str]), citationConfidence (float in [0,1]), confidence (optional float in [0,1])."
                 ),
             ),
             "B": OpenAIExpertAdapter(
@@ -219,7 +469,8 @@ def build_openai_registry(
                 timeout_seconds=timeout_seconds,
                 system_prompt=(
                     "You are Expert B (reasoning). "
-                    "Return structured step-by-step reasoning."
+                    "Return ONLY valid JSON with keys: reasoningSteps (list[str]), verifications (list[str]), "
+                    "checkResult (str), confidence (optional float in [0,1])."
                 ),
             ),
             "C": OpenAIExpertAdapter(
@@ -230,7 +481,8 @@ def build_openai_registry(
                 timeout_seconds=timeout_seconds,
                 system_prompt=(
                     "You are Expert C (writing). "
-                    "Produce clear and faithful final responses from context."
+                    "Return ONLY valid JSON with keys: draft (str), fidelityReport (str), "
+                    "unsupportedStatements (list[str]), confidence (optional float in [0,1])."
                 ),
             ),
         }

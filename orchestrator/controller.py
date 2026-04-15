@@ -10,7 +10,9 @@ from .evaluator import EvalConfig, StateEvaluator
 from .experts import ExpertRegistry
 from .planner import BasePlanner, RulePlanner
 from .protocol import (
+    Budget,
     DagPlan,
+    ExpertName,
     ExpertRequest,
     ExpertResponse,
     NodeState,
@@ -18,6 +20,7 @@ from .protocol import (
     PatchOp,
     ReconstructPatch,
     TaskNode,
+    TaskType,
     states_to_json,
 )
 from .trace import TraceLogger
@@ -145,7 +148,14 @@ class OrchestratorController:
             )
 
             if decision.should_reconstruct:
-                patches = self._build_reconstruct_patches(dag, states)
+                patches = self._build_reconstruct_patches(
+                    query=query,
+                    run_id=run_id,
+                    step=step,
+                    dag=dag,
+                    states=states,
+                    artifacts=artifacts,
+                )
                 applied = 0
                 for patch in patches[: self.config.max_patch_ops_per_round]:
                     if reconstruct_cost_sum + patch.cost_impact > self._reconstruct_cost_cap():
@@ -344,12 +354,152 @@ class OrchestratorController:
     def _all_done(dag: DagPlan, states: Dict[str, NodeState]) -> bool:
         return all(states[n.node_id].status in (NodeStatus.DONE, NodeStatus.SKIPPED) for n in dag.nodes)
 
-    def _build_reconstruct_patches(self, dag: DagPlan, states: Dict[str, NodeState]) -> List[ReconstructPatch]:
+    def _build_reconstruct_patches(
+        self,
+        query: str,
+        run_id: str,
+        step: int,
+        dag: DagPlan,
+        states: Dict[str, NodeState],
+        artifacts: Dict[str, Dict[str, Any]],
+    ) -> List[ReconstructPatch]:
+        planner_patches: List[ReconstructPatch] = []
+        try:
+            planner_patches = self.planner.propose_reconstruct_patches(
+                query=query,
+                dag=dag,
+                states=states,
+                max_patch_ops=self.config.max_patch_ops_per_round,
+                artifacts_summary=self._build_artifacts_summary(artifacts),
+                failed_node_payloads=self._build_failed_node_payloads(states, artifacts),
+            )
+        except Exception as e:
+            self.tracer.log_event(
+                "planner_reconstruct_fallback",
+                {
+                    "runId": run_id,
+                    "step": step,
+                    "reason": str(e),
+                    "planner": self.planner.__class__.__name__,
+                },
+            )
+
+        accepted = [p for p in planner_patches if self._patch_applicable(patch=p, dag=dag)]
+        if accepted:
+            self.tracer.log_event(
+                "planner_reconstruct_proposal",
+                {
+                    "runId": run_id,
+                    "step": step,
+                    "source": "planner",
+                    "patches": [
+                        {
+                            "op": p.op.value,
+                            "targetNode": p.target_node,
+                            "reason": p.reason,
+                            "expectedGain": p.expected_gain,
+                            "costImpact": p.cost_impact,
+                            "newNode": p.new_node.to_dict() if p.new_node else None,
+                        }
+                        for p in accepted
+                    ],
+                },
+            )
+            return accepted
+
+        fallback = self._build_rule_reconstruct_patches(dag=dag, states=states)
+        if fallback:
+            self.tracer.log_event(
+                "planner_reconstruct_proposal",
+                {
+                    "runId": run_id,
+                    "step": step,
+                    "source": "rule_fallback",
+                    "patches": [
+                        {
+                            "op": p.op.value,
+                            "targetNode": p.target_node,
+                            "reason": p.reason,
+                            "expectedGain": p.expected_gain,
+                            "costImpact": p.cost_impact,
+                            "newNode": p.new_node.to_dict() if p.new_node else None,
+                        }
+                        for p in fallback
+                    ],
+                },
+            )
+        return fallback
+
+    @staticmethod
+    def _build_artifacts_summary(artifacts: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        summary: Dict[str, Dict[str, Any]] = {}
+        for node_id, payload in artifacts.items():
+            if not isinstance(payload, dict):
+                summary[node_id] = {"preview": str(payload)[:400]}
+                continue
+            keys = sorted(payload.keys())
+            text_blob = str(payload)
+            summary[node_id] = {
+                "keys": keys,
+                "preview": text_blob[:800],
+            }
+        return summary
+
+    @staticmethod
+    def _build_failed_node_payloads(
+        states: Dict[str, NodeState], artifacts: Dict[str, Dict[str, Any]]
+    ) -> Dict[str, Dict[str, Any]]:
+        failed_payloads: Dict[str, Dict[str, Any]] = {}
+        for node_id, state in states.items():
+            if state.status != NodeStatus.FAILED:
+                continue
+            payload = artifacts.get(node_id, {})
+            failed_payloads[node_id] = {
+                "errorCode": state.error_code,
+                "payloadPreview": str(payload)[:2000],
+                "payloadKeys": sorted(payload.keys()) if isinstance(payload, dict) else [],
+            }
+        return failed_payloads
+
+    @staticmethod
+    def _patch_applicable(patch: ReconstructPatch, dag: DagPlan) -> bool:
+        existing_ids = {n.node_id for n in dag.nodes}
+        if patch.op == PatchOp.ADD:
+            return patch.new_node is not None and patch.new_node.node_id not in existing_ids
+        if patch.op == PatchOp.MODIFY:
+            return patch.new_node is not None and patch.target_node in existing_ids
+        if patch.op == PatchOp.REMOVE:
+            return patch.target_node in existing_ids
+        return False
+
+    def _build_rule_reconstruct_patches(self, dag: DagPlan, states: Dict[str, NodeState]) -> List[ReconstructPatch]:
         failed = [n for n in dag.nodes if states[n.node_id].status == NodeStatus.FAILED]
         if not failed:
             return []
         patches: List[ReconstructPatch] = []
         for target in failed[: self.config.max_patch_ops_per_round]:
+            error_code = states[target.node_id].error_code or ""
+
+            # 1) Prefer in-place MODIFY for richer reconstruct behavior.
+            modify_patch = self._build_modify_patch(target, error_code)
+            if modify_patch is not None:
+                patches.append(modify_patch)
+                continue
+
+            # 2) For terminal failed retry leaf nodes, prune via REMOVE.
+            if target.node_id.endswith("_retry") and self._is_leaf_node(dag, target.node_id):
+                patches.append(
+                    ReconstructPatch(
+                        op=PatchOp.REMOVE,
+                        target_node=target.node_id,
+                        reason="remove terminal failed retry leaf node",
+                        expected_gain=0.1,
+                        cost_impact=0.05,
+                    )
+                )
+                continue
+
+            # 3) Fallback to ADD retry node.
             new_id = f"{target.node_id}_retry"
             if any(n.node_id == new_id for n in dag.nodes):
                 continue
@@ -374,6 +524,70 @@ class OrchestratorController:
         return patches
 
     @staticmethod
+    def _is_leaf_node(dag: DagPlan, node_id: str) -> bool:
+        return all(node_id not in node.dependencies for node in dag.nodes if node.node_id != node_id)
+
+    def _build_modify_patch(self, target: TaskNode, error_code: str) -> ReconstructPatch | None:
+        lowered = error_code.lower()
+        transient_errors = {
+            "mock_b_failure",
+            "network_timeout",
+            "rate_limited",
+            "upstream_server_error",
+            "call_exception",
+            "network_error",
+            "connection_refused",
+            "dns_resolution_failed",
+            "repair_network_timeout",
+            "repair_rate_limited",
+            "repair_upstream_server_error",
+            "repair_call_exception",
+        }
+        schema_errors = {
+            "invalid_json",
+            "invalid_schema",
+            "repair_invalid_json",
+            "repair_invalid_schema",
+        }
+
+        next_expert = target.expert
+        next_budget = Budget(max_tokens=target.budget.max_tokens, max_seconds=target.budget.max_seconds)
+        changed = False
+        reason_parts: List[str] = []
+
+        if lowered in transient_errors and (next_budget.max_tokens < 4096 or next_budget.max_seconds < 120):
+            next_budget.max_tokens = min(4096, max(next_budget.max_tokens + 256, int(next_budget.max_tokens * 1.5)))
+            next_budget.max_seconds = min(120, max(next_budget.max_seconds + 10, int(next_budget.max_seconds * 1.5)))
+            changed = True
+            reason_parts.append("increase node budget for transient runtime error")
+
+        if lowered in schema_errors and target.task_type in (TaskType.REASON, TaskType.VERIFY):
+            if target.expert != ExpertName.C:
+                next_expert = ExpertName.C
+                changed = True
+                reason_parts.append("switch to schema-stable expert for structured output")
+
+        if not changed:
+            return None
+
+        modified = TaskNode(
+            node_id=target.node_id,
+            task_type=target.task_type,
+            expert=next_expert,
+            dependencies=list(target.dependencies),
+            input_refs=list(target.input_refs),
+            budget=next_budget,
+        )
+        return ReconstructPatch(
+            op=PatchOp.MODIFY,
+            target_node=target.node_id,
+            reason="; ".join(reason_parts),
+            expected_gain=0.45,
+            cost_impact=0.12,
+            new_node=modified,
+        )
+
+    @staticmethod
     def _apply_patch(dag: DagPlan, states: Dict[str, NodeState], patch: ReconstructPatch) -> None:
         if patch.op == PatchOp.ADD and patch.new_node is not None:
             existing_ids = {n.node_id for n in dag.nodes}
@@ -386,6 +600,55 @@ class OrchestratorController:
             dag.rewrite_dependency_refs(old_id, patch.new_node.node_id)
             dag.nodes.append(patch.new_node)
             states[patch.new_node.node_id] = NodeState(node_id=patch.new_node.node_id)
+            dag.validate()
+            return
+
+        if patch.op == PatchOp.MODIFY and patch.new_node is not None:
+            idx = next((i for i, node in enumerate(dag.nodes) if node.node_id == patch.target_node), -1)
+            if idx < 0:
+                return
+            original = dag.nodes[idx]
+            replacement = patch.new_node
+            dag.nodes[idx] = replacement
+            if original.node_id != replacement.node_id:
+                dag.rewrite_dependency_refs(original.node_id, replacement.node_id)
+                state = states.pop(original.node_id, None)
+                states[replacement.node_id] = state or NodeState(node_id=replacement.node_id)
+            state = states.get(replacement.node_id)
+            if state is None:
+                states[replacement.node_id] = NodeState(node_id=replacement.node_id)
+            else:
+                state.status = NodeStatus.PENDING
+                state.confidence = 0.0
+                state.risk_score = 0.0
+                state.uncertainty = 1.0
+                state.artifact_ref = ""
+                state.error_code = None
+            dag.validate()
+            return
+
+        if patch.op == PatchOp.REMOVE:
+            target = next((node for node in dag.nodes if node.node_id == patch.target_node), None)
+            if target is None:
+                return
+            for node in dag.nodes:
+                if node.node_id == target.node_id:
+                    continue
+                if target.node_id in node.dependencies:
+                    new_deps: List[str] = []
+                    for dep in node.dependencies:
+                        if dep == target.node_id:
+                            for inherited in target.dependencies:
+                                if inherited not in new_deps:
+                                    new_deps.append(inherited)
+                        elif dep not in new_deps:
+                            new_deps.append(dep)
+                    node.dependencies = new_deps
+                node.input_refs = [ref for ref in node.input_refs if ref != target.node_id]
+            dag.nodes = [node for node in dag.nodes if node.node_id != target.node_id]
+            states.pop(target.node_id, None)
+            if not dag.nodes:
+                return
             dag.validate()
 
     @staticmethod

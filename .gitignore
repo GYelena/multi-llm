@@ -20,6 +20,7 @@ logs/
 DeepSeek-R1/
 Data/
 models/
+outputs/
 
 # 编辑器配置
 .vscode/
