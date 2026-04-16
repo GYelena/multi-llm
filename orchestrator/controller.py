@@ -19,9 +19,11 @@ from .protocol import (
     NodeStatus,
     PatchOp,
     ReconstructPatch,
+    SubgraphReplacementPlan,
     TaskNode,
     TaskType,
     states_to_json,
+    validate_subgraph_replacement_against_dag,
 )
 from .trace import TraceLogger
 
@@ -38,6 +40,8 @@ class OrchestratorConfig:
     """Max patch operations applied in one reconstruct step."""
     reconstruct_budget_ratio: float = 0.25
     """Fraction of max_steps used as additional cap on reconstruct count."""
+    subgraph_planner_max_attempts: int = 2
+    """Max planner attempts for one subgraph proposal before fallback."""
 
 
 class OrchestratorController:
@@ -92,6 +96,7 @@ class OrchestratorController:
         patches_applied_total = 0
         last_reconstruct_step = -999
         reconstruct_cost_sum = 0.0
+        subgraph_reconstruct_count = 0
         expert_call_count = 0
         last_step = 0
 
@@ -148,6 +153,65 @@ class OrchestratorController:
             )
 
             if decision.should_reconstruct:
+                subgraph_plan = self._build_reconstruct_subgraph_plan(
+                    query=query,
+                    run_id=run_id,
+                    step=step,
+                    dag=dag,
+                    states=states,
+                    artifacts=artifacts,
+                )
+                if subgraph_plan is not None:
+                    equivalent_ops = self._estimate_subgraph_equivalent_ops(subgraph_plan)
+                    if equivalent_ops > self.config.max_patch_ops_per_round:
+                        self.tracer.log_event(
+                            "controller_subgraph_reconstruct_skipped",
+                            {
+                                "runId": run_id,
+                                "step": step,
+                                "reason": "equivalent op cap exceeded",
+                                "equivalentOps": equivalent_ops,
+                                "maxPatchOpsPerRound": self.config.max_patch_ops_per_round,
+                            },
+                        )
+                    elif reconstruct_cost_sum + subgraph_plan.cost_impact > self._reconstruct_cost_cap():
+                        self.tracer.log_event(
+                            "controller_subgraph_reconstruct_skipped",
+                            {
+                                "runId": run_id,
+                                "step": step,
+                                "reason": "reconstruct cost cap exceeded",
+                                "reconstructCostSum": reconstruct_cost_sum,
+                                "planCost": subgraph_plan.cost_impact,
+                            },
+                        )
+                    else:
+                        self._apply_subgraph_replacement(dag=dag, states=states, plan=subgraph_plan)
+                        reconstruct_cost_sum += subgraph_plan.cost_impact
+                        reconstruct_rounds += 1
+                        subgraph_reconstruct_count += 1
+                        patches_applied_total += equivalent_ops
+                        last_reconstruct_step = step
+                        self.tracer.log_event(
+                            "controller_subgraph_reconstruct",
+                            {
+                                "runId": run_id,
+                                "step": step,
+                                "replaceRootNode": subgraph_plan.replace_root_node,
+                                "removeNodeIds": subgraph_plan.remove_node_ids,
+                                "newNodes": [n.to_dict() for n in subgraph_plan.new_nodes],
+                                "bridgeDependencies": subgraph_plan.bridge_dependencies,
+                                "reason": subgraph_plan.reason,
+                                "expectedGain": subgraph_plan.expected_gain,
+                                "costImpact": subgraph_plan.cost_impact,
+                                "equivalentOps": equivalent_ops,
+                                "reconstructCostSum": reconstruct_cost_sum,
+                            },
+                        )
+                        if self._all_done(dag, states):
+                            break
+                        continue
+
                 patches = self._build_reconstruct_patches(
                     query=query,
                     run_id=run_id,
@@ -221,6 +285,7 @@ class OrchestratorController:
                 "reconstructRounds": reconstruct_rounds,
                 "patchesAppliedTotal": patches_applied_total,
                 "reconstructCostSum": reconstruct_cost_sum,
+                "subgraphReconstructCount": subgraph_reconstruct_count,
                 "durationMs": duration_ms,
                 "expertCallCount": expert_call_count,
                 "controllerSteps": last_step,
@@ -246,6 +311,7 @@ class OrchestratorController:
                 "reconstructRounds": reconstruct_rounds,
                 "patchesAppliedTotal": patches_applied_total,
                 "reconstructCostSum": reconstruct_cost_sum,
+                "subgraphReconstructCount": subgraph_reconstruct_count,
                 "traceGlobalPath": str(self.tracer.path.resolve()),
                 "traceRunPath": run_trace_path,
             },
@@ -258,6 +324,7 @@ class OrchestratorController:
             "reconstructRounds": reconstruct_rounds,
             "patchesAppliedTotal": patches_applied_total,
             "reconstructCostSum": reconstruct_cost_sum,
+            "subgraphReconstructCount": subgraph_reconstruct_count,
             "durationMs": duration_ms,
             "expertCallCount": expert_call_count,
             "controllerSteps": last_step,
@@ -430,18 +497,112 @@ class OrchestratorController:
             )
         return fallback
 
+    def _build_reconstruct_subgraph_plan(
+        self,
+        query: str,
+        run_id: str,
+        step: int,
+        dag: DagPlan,
+        states: Dict[str, NodeState],
+        artifacts: Dict[str, Dict[str, Any]],
+    ) -> SubgraphReplacementPlan | None:
+        context = self._build_failed_subgraph_context(dag=dag, states=states, artifacts=artifacts)
+        if not context["failedSubgraphNodeIds"]:
+            return None
+        max_attempts = max(1, int(self.config.subgraph_planner_max_attempts))
+        for attempt in range(1, max_attempts + 1):
+            try:
+                plan = self.planner.propose_subgraph_replacement(
+                    query=query,
+                    dag=dag,
+                    states=states,
+                    max_patch_ops=self.config.max_patch_ops_per_round,
+                    artifacts_summary=self._build_artifacts_summary(artifacts),
+                    failed_node_payloads=self._build_failed_node_payloads(states, artifacts),
+                    failed_subgraph_nodes=context["failedSubgraphNodes"],
+                    failed_subgraph_states=context["failedSubgraphStates"],
+                    failed_subgraph_artifacts=context["failedSubgraphArtifacts"],
+                )
+            except Exception as e:
+                self.tracer.log_event(
+                    "planner_subgraph_fallback",
+                    {
+                        "runId": run_id,
+                        "step": step,
+                        "reason": str(e),
+                        "planner": self.planner.__class__.__name__,
+                        "attempt": attempt,
+                        "maxAttempts": max_attempts,
+                        "willRetry": attempt < max_attempts,
+                    },
+                )
+                continue
+
+            if plan is None:
+                self.tracer.log_event(
+                    "planner_subgraph_fallback",
+                    {
+                        "runId": run_id,
+                        "step": step,
+                        "reason": "empty subgraph proposal",
+                        "planner": self.planner.__class__.__name__,
+                        "attempt": attempt,
+                        "maxAttempts": max_attempts,
+                        "willRetry": attempt < max_attempts,
+                    },
+                )
+                continue
+
+            try:
+                self._validate_subgraph_replacement(
+                    dag=dag, plan=plan, allowed_node_ids=set(context["failedSubgraphNodeIds"])
+                )
+            except Exception as e:
+                self.tracer.log_event(
+                    "planner_subgraph_fallback",
+                    {
+                        "runId": run_id,
+                        "step": step,
+                        "reason": f"invalid subgraph proposal: {e}",
+                        "planner": self.planner.__class__.__name__,
+                        "attempt": attempt,
+                        "maxAttempts": max_attempts,
+                        "willRetry": attempt < max_attempts,
+                    },
+                )
+                continue
+
+            self.tracer.log_event(
+                "planner_subgraph_proposal",
+                {
+                    "runId": run_id,
+                    "step": step,
+                    "replaceRootNode": plan.replace_root_node,
+                    "removeNodeIds": plan.remove_node_ids,
+                    "newNodeCount": len(plan.new_nodes),
+                    "bridgeDependencies": plan.bridge_dependencies,
+                    "reason": plan.reason,
+                    "expectedGain": plan.expected_gain,
+                    "costImpact": plan.cost_impact,
+                    "failedSubgraphNodeIds": context["failedSubgraphNodeIds"],
+                    "attempt": attempt,
+                    "maxAttempts": max_attempts,
+                },
+            )
+            return plan
+        return None
+
     @staticmethod
     def _build_artifacts_summary(artifacts: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
         summary: Dict[str, Dict[str, Any]] = {}
         for node_id, payload in artifacts.items():
             if not isinstance(payload, dict):
-                summary[node_id] = {"preview": str(payload)[:400]}
+                summary[node_id] = {"preview": OrchestratorController._preview_text(payload, head=300, tail=240)}
                 continue
             keys = sorted(payload.keys())
-            text_blob = str(payload)
             summary[node_id] = {
                 "keys": keys,
-                "preview": text_blob[:800],
+                "preview": OrchestratorController._preview_text(payload, head=500, tail=300),
             }
         return summary
 
@@ -456,10 +617,135 @@ class OrchestratorController:
             payload = artifacts.get(node_id, {})
             failed_payloads[node_id] = {
                 "errorCode": state.error_code,
-                "payloadPreview": str(payload)[:2000],
+                "payloadPreview": OrchestratorController._preview_text(payload, head=1200, tail=600),
                 "payloadKeys": sorted(payload.keys()) if isinstance(payload, dict) else [],
             }
         return failed_payloads
+
+    @staticmethod
+    def _preview_text(payload: Any, head: int, tail: int) -> str:
+        text = str(payload)
+        if len(text) <= head + tail + 20:
+            return text
+        return f"{text[:head]}\n...<truncated {len(text) - head - tail} chars>...\n{text[-tail:]}"
+
+    @staticmethod
+    def _collect_descendants(dag: DagPlan, root_node_id: str) -> List[str]:
+        children: Dict[str, List[str]] = {}
+        for node in dag.nodes:
+            for dep in node.dependencies:
+                children.setdefault(dep, []).append(node.node_id)
+        result: List[str] = []
+        queue = list(children.get(root_node_id, []))
+        seen = set(queue)
+        while queue:
+            curr = queue.pop(0)
+            result.append(curr)
+            for child in children.get(curr, []):
+                if child in seen:
+                    continue
+                seen.add(child)
+                queue.append(child)
+        return result
+
+    def _build_failed_subgraph_context(
+        self, dag: DagPlan, states: Dict[str, NodeState], artifacts: Dict[str, Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        failed_nodes = [node for node in dag.nodes if states[node.node_id].status == NodeStatus.FAILED]
+        if not failed_nodes:
+            return {
+                "failedSubgraphNodeIds": [],
+                "failedSubgraphNodes": [],
+                "failedSubgraphStates": {},
+                "failedSubgraphArtifacts": {},
+            }
+
+        root = failed_nodes[0]
+        descendant_ids = self._collect_descendants(dag, root.node_id)
+        ordered_ids = [root.node_id] + [nid for nid in descendant_ids if nid != root.node_id]
+        selected = set(ordered_ids)
+        failed_subgraph_nodes = [node.to_dict() for node in dag.nodes if node.node_id in selected]
+        failed_subgraph_states = {
+            node_id: {
+                "status": states[node_id].status.value,
+                "confidence": states[node_id].confidence,
+                "riskScore": states[node_id].risk_score,
+                "uncertainty": states[node_id].uncertainty,
+                "artifactRef": states[node_id].artifact_ref,
+                "errorCode": states[node_id].error_code,
+            }
+            for node_id in ordered_ids
+            if node_id in states
+        }
+        failed_subgraph_artifacts = {
+            node_id: {
+                "keys": sorted(artifacts.get(node_id, {}).keys()) if isinstance(artifacts.get(node_id), dict) else [],
+                "preview": self._preview_text(artifacts.get(node_id, {}), head=600, tail=300),
+            }
+            for node_id in ordered_ids
+        }
+        return {
+            "failedSubgraphNodeIds": ordered_ids,
+            "failedSubgraphNodes": failed_subgraph_nodes,
+            "failedSubgraphStates": failed_subgraph_states,
+            "failedSubgraphArtifacts": failed_subgraph_artifacts,
+        }
+
+    @staticmethod
+    def _estimate_subgraph_equivalent_ops(plan: SubgraphReplacementPlan) -> int:
+        return max(1, len(plan.remove_node_ids) + len(plan.new_nodes))
+
+    @staticmethod
+    def _validate_subgraph_replacement(
+        dag: DagPlan, plan: SubgraphReplacementPlan, allowed_node_ids: set[str]
+    ) -> None:
+        validate_subgraph_replacement_against_dag(plan, dag)
+        remove_set = set(plan.remove_node_ids)
+        if not remove_set.issubset(allowed_node_ids):
+            raise ValueError("removeNodeIds must be limited to failed root + descendants")
+        if plan.replace_root_node not in remove_set:
+            raise ValueError("replaceRootNode must be included in removeNodeIds")
+
+        retained_nodes = [node for node in dag.nodes if node.node_id not in remove_set]
+        for node in retained_nodes:
+            leaked = [dep for dep in node.dependencies if dep in remove_set]
+            if leaked:
+                raise ValueError(f"retained node '{node.node_id}' depends on removed node(s) {leaked}")
+
+        retained_ids = {node.node_id for node in retained_nodes}
+        new_ids = {node.node_id for node in plan.new_nodes}
+        all_candidate_ids = retained_ids | new_ids
+
+        for new_node in plan.new_nodes:
+            merged_deps = list(new_node.dependencies)
+            for dep in plan.bridge_dependencies.get(new_node.node_id, []):
+                if dep not in merged_deps:
+                    merged_deps.append(dep)
+            for dep in merged_deps:
+                if dep not in all_candidate_ids:
+                    raise ValueError(f"new node '{new_node.node_id}' references unknown dependency '{dep}'")
+
+        candidate_nodes = list(retained_nodes)
+        for new_node in plan.new_nodes:
+            extra_deps = plan.bridge_dependencies.get(new_node.node_id, [])
+            deps = list(new_node.dependencies)
+            refs = list(new_node.input_refs)
+            for dep in extra_deps:
+                if dep not in deps:
+                    deps.append(dep)
+                if dep not in refs:
+                    refs.append(dep)
+            candidate_nodes.append(
+                TaskNode(
+                    node_id=new_node.node_id,
+                    task_type=new_node.task_type,
+                    expert=new_node.expert,
+                    dependencies=deps,
+                    input_refs=refs,
+                    budget=new_node.budget,
+                )
+            )
+        DagPlan(nodes=candidate_nodes).validate()
 
     @staticmethod
     def _patch_applicable(patch: ReconstructPatch, dag: DagPlan) -> bool:
@@ -650,6 +936,46 @@ class OrchestratorController:
             if not dag.nodes:
                 return
             dag.validate()
+
+    @staticmethod
+    def _apply_subgraph_replacement(
+        dag: DagPlan, states: Dict[str, NodeState], plan: SubgraphReplacementPlan
+    ) -> None:
+        remove_set = set(plan.remove_node_ids)
+        retained_nodes = [node for node in dag.nodes if node.node_id not in remove_set]
+        for node in retained_nodes:
+            if any(dep in remove_set for dep in node.dependencies):
+                raise ValueError(f"cannot remove nodes still required by retained node '{node.node_id}'")
+
+        for node_id in remove_set:
+            if node_id in states:
+                states[node_id].status = NodeStatus.SKIPPED
+                states[node_id].artifact_ref = ""
+                states[node_id].error_code = states[node_id].error_code or "subgraph_replaced"
+
+        inserted_nodes: List[TaskNode] = []
+        for node in plan.new_nodes:
+            deps = list(node.dependencies)
+            refs = list(node.input_refs)
+            for dep in plan.bridge_dependencies.get(node.node_id, []):
+                if dep not in deps:
+                    deps.append(dep)
+                if dep not in refs:
+                    refs.append(dep)
+            inserted_nodes.append(
+                TaskNode(
+                    node_id=node.node_id,
+                    task_type=node.task_type,
+                    expert=node.expert,
+                    dependencies=deps,
+                    input_refs=refs,
+                    budget=node.budget,
+                )
+            )
+            states[node.node_id] = NodeState(node_id=node.node_id)
+
+        dag.nodes = retained_nodes + inserted_nodes
+        dag.validate()
 
     @staticmethod
     def _synthesize_final_answer(query: str, artifacts: Dict[str, Dict[str, Any]]) -> str:

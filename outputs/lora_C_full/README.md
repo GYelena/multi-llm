@@ -3,8 +3,8 @@ library_name: transformers
 model_name: lora_C_full
 tags:
 - generated_from_trainer
-- trl
 - sft
+- trl
 licence: license
 ---
 

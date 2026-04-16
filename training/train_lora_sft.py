@@ -70,6 +70,27 @@ def row_to_text(tokenizer: Any, example: Dict[str, Any], use_chat: bool) -> str:
     )
 
 
+def truncate_text_to_tokens(tokenizer: Any, text: str, max_tokens: int) -> str:
+    if max_tokens <= 0 or not text:
+        return text
+    try:
+        enc = tokenizer(
+            text,
+            truncation=True,
+            max_length=max_tokens,
+            add_special_tokens=False,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )
+        ids = enc.get("input_ids", [])
+        if not ids:
+            return ""
+        return tokenizer.decode(ids, skip_special_tokens=False)
+    except Exception:
+        # Fall back to raw text if tokenizer-level truncation unexpectedly fails.
+        return text
+
+
 def iter_jsonl_rows(path: Path, max_samples: Optional[int]) -> Iterator[Dict[str, Any]]:
     with path.open("r", encoding="utf-8") as f:
         n = 0
@@ -95,12 +116,38 @@ def build_dataset(
     use_chat: bool,
     max_samples: Optional[int],
     streaming: bool,
+    max_seq_length: int,
+    max_line_chars: int,
 ) -> Dataset | IterableDataset:
     """Build HF dataset with column 'text' for SFTTrainer."""
 
     def gen() -> Iterator[Dict[str, str]]:
-        for row in iter_jsonl_rows(path, max_samples):
-            yield {"text": row_to_text(tokenizer, row, use_chat)}
+        with path.open("r", encoding="utf-8") as f:
+            n = 0
+            skipped_oversize = 0
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if max_line_chars > 0 and len(line) > max_line_chars:
+                    skipped_oversize += 1
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not row.get("instruction") and not row.get("input"):
+                    continue
+                text = row_to_text(tokenizer, row, use_chat)
+                text = truncate_text_to_tokens(tokenizer, text, max_seq_length)
+                if not text:
+                    continue
+                yield {"text": text}
+                n += 1
+                if max_samples is not None and n >= max_samples:
+                    break
+            if skipped_oversize > 0:
+                logger.warning("Skipped %s oversize JSONL lines (max_line_chars=%s)", skipped_oversize, max_line_chars)
 
     if not streaming:
         if max_samples is None:
@@ -108,7 +155,8 @@ def build_dataset(
                 "--no-streaming requires --max-samples (avoid loading a multi-GB JSONL into RAM)"
             )
         rows = list(iter_jsonl_rows(path, max_samples))
-        texts = [row_to_text(tokenizer, r, use_chat) for r in rows]
+        texts = [truncate_text_to_tokens(tokenizer, row_to_text(tokenizer, r, use_chat), max_seq_length) for r in rows]
+        texts = [t for t in texts if t]
         return Dataset.from_dict({"text": texts})
 
     # Line-streamed iterable (default for large files)
@@ -160,6 +208,12 @@ def main() -> None:
     p.add_argument("--logging-steps", type=int, default=10)
     p.add_argument("--save-steps", type=int, default=500)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--max-line-chars",
+        type=int,
+        default=400000,
+        help="Skip raw JSONL lines longer than this character count (guard against pathological samples)",
+    )
     p.add_argument("--format", choices=["alpaca", "chat"], default="chat")
     p.add_argument("--lora-r", type=int, default=32)
     p.add_argument("--lora-alpha", type=int, default=64)
@@ -205,7 +259,13 @@ def main() -> None:
     use_chat = args.format == "chat"
 
     train_ds = build_dataset(
-        data_path, tokenizer, use_chat, args.max_samples, args.streaming
+        data_path,
+        tokenizer,
+        use_chat,
+        args.max_samples,
+        args.streaming,
+        args.max_seq_length,
+        args.max_line_chars,
     )
 
     quant_config = None

@@ -6,6 +6,7 @@ import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from .protocol import ExpertRequest, ExpertResponse
@@ -417,6 +418,152 @@ class OpenAIExpertAdapter(BaseExpertAdapter):
         )
 
 
+@dataclass
+class LocalRetrieverAAdapter(BaseExpertAdapter):
+    checkpoint: str
+    base_model: str
+    index_dir: str
+    top_k: int = 5
+
+    _loaded: bool = False
+    _tokenizer: Any = None
+    _model: Any = None
+    _torch: Any = None
+    _index: Any = None
+    _docs: list[Dict[str, Any]] | None = None
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        try:
+            import faiss  # type: ignore
+            import torch  # type: ignore
+            from transformers import AutoModel, AutoTokenizer  # type: ignore
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"local retriever dependencies missing: {e}") from e
+
+        index_dir = Path(self.index_dir).resolve()
+        index_path = index_dir / "index.faiss"
+        docs_path = index_dir / "docs.jsonl"
+        if not index_path.exists() or not docs_path.exists():
+            raise FileNotFoundError(
+                f"retriever index artifacts missing under {index_dir} (need index.faiss + docs.jsonl)"
+            )
+
+        def _try_load(path: str) -> tuple[Any, Any]:
+            tok = AutoTokenizer.from_pretrained(path)
+            mdl = AutoModel.from_pretrained(path, torch_dtype=torch.bfloat16, device_map="auto")
+            return tok, mdl
+
+        try:
+            tokenizer, model = _try_load(self.checkpoint)
+        except Exception:
+            tokenizer, model = _try_load(self.base_model)
+        model.eval()
+
+        docs: list[Dict[str, Any]] = []
+        with docs_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(obj, dict):
+                    docs.append(obj)
+
+        self._torch = torch
+        self._tokenizer = tokenizer
+        self._model = model
+        self._index = faiss.read_index(str(index_path))
+        self._docs = docs
+        self._loaded = True
+
+    def _embed(self, text: str) -> Any:
+        assert self._tokenizer is not None and self._model is not None and self._torch is not None
+        prompt = "Represent this sentence for searching relevant passages: " + text
+        with self._torch.no_grad():
+            batch = self._tokenizer(
+                [prompt],
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt",
+            ).to(self._model.device)
+            out = self._model(**batch)
+            hidden = out.last_hidden_state
+            mask = batch["attention_mask"].unsqueeze(-1).float()
+            summed = (hidden * mask).sum(dim=1)
+            denom = mask.sum(dim=1).clamp(min=1e-9)
+            emb = summed / denom
+            emb = self._torch.nn.functional.normalize(emb, p=2, dim=1)
+            return emb.detach().cpu().float().numpy().astype("float32")
+
+    def run(self, request: ExpertRequest) -> ExpertResponse:
+        try:
+            self._ensure_loaded()
+            assert self._index is not None and self._docs is not None
+            q = request.query
+            vec = self._embed(q)
+            k = max(1, int(self.top_k))
+            scores, indices = self._index.search(vec, k)
+            scores_row = scores[0].tolist() if len(scores) > 0 else []
+            idx_row = indices[0].tolist() if len(indices) > 0 else []
+            evidences: list[str] = []
+            source_refs: list[str] = []
+            for rank, idx in enumerate(idx_row):
+                if idx < 0 or idx >= len(self._docs):
+                    continue
+                doc = self._docs[idx]
+                text = str(doc.get("text", "")).strip()
+                title = str(doc.get("title", "")).strip()
+                doc_id = str(doc.get("doc_id", f"doc:{idx}")).strip()
+                snippet = text[:420]
+                if title:
+                    evidences.append(f"{title}\n{snippet}")
+                else:
+                    evidences.append(snippet)
+                source_refs.append(doc_id or f"doc:{idx}")
+                if rank + 1 >= k:
+                    break
+
+            if not evidences:
+                return ExpertResponse(
+                    node_id=request.node.node_id,
+                    summary="local retriever returned no hits",
+                    confidence=0.0,
+                    payload={},
+                    error_code="retrieval_empty",
+                )
+
+            top_score = float(scores_row[0]) if scores_row else 0.0
+            citation_conf = max(0.0, min(1.0, (top_score + 1.0) / 2.0))
+            payload = {
+                "claims": [f"Retrieved top-{len(evidences)} passages for query."],
+                "evidences": evidences,
+                "sourceRefs": source_refs,
+                "citationConfidence": citation_conf,
+                "confidence": citation_conf,
+            }
+            return ExpertResponse(
+                node_id=request.node.node_id,
+                summary="local retriever complete",
+                confidence=citation_conf,
+                payload=payload,
+                error_code=None,
+            )
+        except Exception as e:  # noqa: BLE001
+            return ExpertResponse(
+                node_id=request.node.node_id,
+                summary="local retriever exception",
+                confidence=0.0,
+                payload={"exception": str(e)},
+                error_code="retriever_exception",
+            )
+
+
 class ExpertRegistry:
     def __init__(self, adapters: Dict[str, BaseExpertAdapter]) -> None:
         self.adapters = adapters
@@ -442,29 +589,49 @@ def build_openai_registry(
     a_base_url: str,
     b_base_url: str,
     c_base_url: str,
+    a_backend: str = "openai",
+    a_retriever_checkpoint: str = "",
+    a_retriever_base_model: str = "",
+    a_retriever_index_dir: str = "",
+    a_retriever_top_k: int = 5,
+    a_model_name: Optional[str] = None,
+    b_model_name: Optional[str] = None,
+    c_model_name: Optional[str] = None,
     api_key: Optional[str] = None,
     *,
     timeout_seconds: int = 60,
 ) -> ExpertRegistry:
     shared_key = api_key or "dummy"
+    resolved_a_model = str(a_model_name or model_name)
+    resolved_b_model = str(b_model_name or model_name)
+    resolved_c_model = str(c_model_name or model_name)
+    if str(a_backend).strip().lower() == "local_retriever":
+        a_adapter: BaseExpertAdapter = LocalRetrieverAAdapter(
+            checkpoint=str(a_retriever_checkpoint),
+            base_model=str(a_retriever_base_model),
+            index_dir=str(a_retriever_index_dir),
+            top_k=max(1, int(a_retriever_top_k)),
+        )
+    else:
+        a_adapter = OpenAIExpertAdapter(
+            expert_name="A",
+            base_url=a_base_url,
+            model=resolved_a_model,
+            api_key=shared_key,
+            timeout_seconds=timeout_seconds,
+            system_prompt=(
+                "You are Expert A (factual retrieval and grounding). "
+                "Return ONLY valid JSON with keys: claims (list[str]), evidences (list[str]), "
+                "sourceRefs (list[str]), citationConfidence (float in [0,1]), confidence (optional float in [0,1])."
+            ),
+        )
     return ExpertRegistry(
         {
-            "A": OpenAIExpertAdapter(
-                expert_name="A",
-                base_url=a_base_url,
-                model=model_name,
-                api_key=shared_key,
-                timeout_seconds=timeout_seconds,
-                system_prompt=(
-                    "You are Expert A (factual retrieval and grounding). "
-                    "Return ONLY valid JSON with keys: claims (list[str]), evidences (list[str]), "
-                    "sourceRefs (list[str]), citationConfidence (float in [0,1]), confidence (optional float in [0,1])."
-                ),
-            ),
+            "A": a_adapter,
             "B": OpenAIExpertAdapter(
                 expert_name="B",
                 base_url=b_base_url,
-                model=model_name,
+                model=resolved_b_model,
                 api_key=shared_key,
                 timeout_seconds=timeout_seconds,
                 system_prompt=(
@@ -476,7 +643,7 @@ def build_openai_registry(
             "C": OpenAIExpertAdapter(
                 expert_name="C",
                 base_url=c_base_url,
-                model=model_name,
+                model=resolved_c_model,
                 api_key=shared_key,
                 timeout_seconds=timeout_seconds,
                 system_prompt=(

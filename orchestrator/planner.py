@@ -14,9 +14,11 @@ from .protocol import (
     NodeState,
     PatchOp,
     ReconstructPatch,
+    SubgraphReplacementPlan,
     TaskNode,
     TaskType,
     states_to_json,
+    validate_subgraph_replacement_against_dag,
 )
 
 
@@ -37,6 +39,20 @@ class BasePlanner(ABC):
         failed_node_payloads: Dict[str, Dict[str, Any]],
     ) -> List[ReconstructPatch]:
         return []
+
+    def propose_subgraph_replacement(
+        self,
+        query: str,
+        dag: DagPlan,
+        states: Dict[str, NodeState],
+        max_patch_ops: int,
+        artifacts_summary: Dict[str, Dict[str, Any]],
+        failed_node_payloads: Dict[str, Dict[str, Any]],
+        failed_subgraph_nodes: List[Dict[str, Any]],
+        failed_subgraph_states: Dict[str, Dict[str, Any]],
+        failed_subgraph_artifacts: Dict[str, Dict[str, Any]],
+    ) -> SubgraphReplacementPlan | None:
+        return None
 
 
 @dataclass
@@ -160,9 +176,15 @@ class OpenAIJsonPlanner(BasePlanner):
     model: str
     api_key: str = "dummy"
     timeout_seconds: int = 60
+    prefer_response_format_json: bool = True
 
     def plan(self, query: str) -> DagPlan:
-        text = self._chat_once(system_prompt=self._system_prompt(), user_content=query, temperature=0.2)
+        text = self._chat_once(
+            system_prompt=self._system_prompt(),
+            user_content=query,
+            temperature=0.2,
+            expect_json=True,
+        )
         if not text:
             raise RuntimeError("planner returned empty content")
 
@@ -202,6 +224,7 @@ class OpenAIJsonPlanner(BasePlanner):
             system_prompt=self._reconstruct_system_prompt(),
             user_content=json.dumps(payload, ensure_ascii=False),
             temperature=0.1,
+            expect_json=True,
         )
         if not text:
             return []
@@ -211,39 +234,112 @@ class OpenAIJsonPlanner(BasePlanner):
             parsed = self._try_extract_embedded_json(text)
         return parse_reconstruct_patches(parsed, dag=dag, max_patch_ops=max_patch_ops)
 
-    def _chat_once(self, system_prompt: str, user_content: str, temperature: float) -> str:
+    def propose_subgraph_replacement(
+        self,
+        query: str,
+        dag: DagPlan,
+        states: Dict[str, NodeState],
+        max_patch_ops: int,
+        artifacts_summary: Dict[str, Dict[str, Any]],
+        failed_node_payloads: Dict[str, Dict[str, Any]],
+        failed_subgraph_nodes: List[Dict[str, Any]],
+        failed_subgraph_states: Dict[str, Dict[str, Any]],
+        failed_subgraph_artifacts: Dict[str, Dict[str, Any]],
+    ) -> SubgraphReplacementPlan | None:
+        base_payload = {
+            "query": query,
+            "maxPatchOps": max_patch_ops,
+            "dag": {"nodes": [n.to_dict() for n in dag.nodes]},
+            "states": states_to_json(states),
+            "artifactsSummary": artifacts_summary,
+            "failedNodePayloads": failed_node_payloads,
+            "failedSubgraphNodes": failed_subgraph_nodes,
+            "failedSubgraphStates": failed_subgraph_states,
+            "failedSubgraphArtifacts": failed_subgraph_artifacts,
+        }
+        planner_context_summary = ""
+        try:
+            planner_context_summary = self._summarize_reconstruct_context(base_payload)
+        except Exception:
+            planner_context_summary = ""
+        payload = {
+            **base_payload,
+            "plannerContextSummary": planner_context_summary,
+        }
+        text = self._chat_once(
+            system_prompt=self._subgraph_reconstruct_system_prompt(),
+            user_content=json.dumps(payload, ensure_ascii=False),
+            temperature=0.1,
+            expect_json=True,
+        )
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = self._try_extract_embedded_json(text)
+        return parse_subgraph_replacement(parsed, dag=dag, max_patch_ops=max_patch_ops)
+
+    def _chat_once(self, system_prompt: str, user_content: str, temperature: float, expect_json: bool = False) -> str:
         url = f"{self.base_url.rstrip('/')}/v1/chat/completions"
-        body = {
+        base_body = {
             "model": self.model,
             "temperature": temperature,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
+            # Explicitly avoid tool-call paths for planner robustness.
+            "tool_choice": "none",
         }
-        req = urllib.request.Request(
-            url,
-            method="POST",
-            data=json.dumps(body).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            raise RuntimeError(f"planner HTTP error: {e.code}") from e
-        except Exception as e:
-            raise RuntimeError("planner request failed") from e
-        return self._extract_text(data)
+        attempts: List[Dict[str, Any]] = []
+        if expect_json and self.prefer_response_format_json:
+            attempts.append(
+                {
+                    **base_body,
+                    "response_format": {"type": "json_object"},
+                }
+            )
+        attempts.append(base_body)
+
+        last_error: Exception | None = None
+        for i, body in enumerate(attempts):
+            req = urllib.request.Request(
+                url,
+                method="POST",
+                data=json.dumps(body).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.api_key}",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                return self._extract_text(data)
+            except urllib.error.HTTPError as e:
+                last_error = e
+                # Some backends reject response_format/tool_choice in chat payload.
+                # If the first attempt fails, fall back to plain payload once.
+                if i < len(attempts) - 1:
+                    continue
+                raise RuntimeError(f"planner HTTP error: {e.code}") from e
+            except Exception as e:
+                last_error = e
+                if i < len(attempts) - 1:
+                    continue
+                raise RuntimeError("planner request failed") from e
+
+        if last_error is not None:
+            raise RuntimeError("planner request failed") from last_error
+        raise RuntimeError("planner request failed")
 
     def _summarize_reconstruct_context(self, payload: Dict[str, Any]) -> str:
         text = self._chat_once(
             system_prompt=self._reconstruct_summary_prompt(),
             user_content=json.dumps(payload, ensure_ascii=False),
             temperature=0.0,
+            expect_json=False,
         )
         return text.strip()[:2000]
 
@@ -294,6 +390,20 @@ class OpenAIJsonPlanner(BasePlanner):
             "Given DAG nodes, node states, artifacts summary and failed-node payload snippets, "
             "write a concise operational summary for a planner model. "
             "Output plain text only in <= 12 lines focusing on failure causes, likely fixes, and dependency impact."
+        )
+
+    @staticmethod
+    def _subgraph_reconstruct_system_prompt() -> str:
+        return (
+            "You are a subgraph reconstruct planner for a DAG executor. "
+            "Return ONLY valid JSON with schema: "
+            '{"replacement":{"replaceRootNode":"T2","removeNodeIds":["T2","T3"],"newNodes":['
+            '{"nodeId":"T2_new","taskType":"retrieve|reason|write|verify","expert":"A|B|C",'
+            '"dependencies":["..."],"inputRefs":["..."],"budget":{"maxTokens":int,"maxSeconds":int}}],'
+            '"bridgeDependencies":{"T2_new":["T1"]},"reason":"...","expectedGain":0.0,"costImpact":0.0}}. '
+            "Rules: removeNodeIds should normally cover failed root and descendants, newNodes must be acyclic, "
+            "all dependencies must reference either retained nodes or newNodes, and plan must respect maxPatchOps "
+            "by minimizing equivalent operations."
         )
 
 
@@ -358,6 +468,57 @@ def parse_reconstruct_patches(data: Dict[str, Any], dag: DagPlan, max_patch_ops:
             )
         )
     return patches
+
+
+def parse_subgraph_replacement(
+    data: Dict[str, Any], dag: DagPlan, max_patch_ops: int
+) -> SubgraphReplacementPlan | None:
+    raw = data.get("replacement")
+    if not isinstance(raw, dict):
+        return None
+
+    replace_root_node = str(raw.get("replaceRootNode", "")).strip()
+    remove_node_ids = [str(x).strip() for x in raw.get("removeNodeIds", []) if str(x).strip()]
+    raw_new_nodes = raw.get("newNodes", [])
+    if not isinstance(raw_new_nodes, list):
+        return None
+    if not replace_root_node or not remove_node_ids or not raw_new_nodes:
+        return None
+
+    new_nodes: List[TaskNode] = []
+    for item in raw_new_nodes:
+        if not isinstance(item, dict):
+            return None
+        try:
+            new_nodes.append(_parse_task_node(item))
+        except Exception:
+            return None
+
+    bridge_raw = raw.get("bridgeDependencies", {}) or {}
+    bridge_dependencies: Dict[str, List[str]] = {}
+    if not isinstance(bridge_raw, dict):
+        return None
+    for nid, deps in bridge_raw.items():
+        if not isinstance(deps, list):
+            return None
+        clean_deps = [str(d).strip() for d in deps if str(d).strip()]
+        bridge_dependencies[str(nid).strip()] = clean_deps
+
+    plan = SubgraphReplacementPlan(
+        replace_root_node=replace_root_node,
+        remove_node_ids=remove_node_ids,
+        new_nodes=new_nodes,
+        bridge_dependencies=bridge_dependencies,
+        reason=str(raw.get("reason", "")).strip() or "planner suggested subgraph replacement",
+        expected_gain=_to_float(raw.get("expectedGain"), default=0.5),
+        cost_impact=_to_float(raw.get("costImpact"), default=0.2),
+    )
+    validate_subgraph_replacement_against_dag(plan, dag)
+
+    equivalent_ops = max(1, len(plan.remove_node_ids) + len(plan.new_nodes))
+    if equivalent_ops > max_patch_ops:
+        return None
+    return plan
 
 
 def _parse_task_node(raw: Dict[str, Any], fallback_node_id: str = "") -> TaskNode:

@@ -97,6 +97,12 @@ def parse_args() -> argparse.Namespace:
         default=50000,
         help="每处理多少文档写一次中间索引与meta（0表示只在最后写）",
     )
+    parser.add_argument(
+        "--resume-index",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="若output目录已有index/docs/meta则自动断点续跑（默认开启）",
+    )
     return parser.parse_args()
 
 def default_corpus_parquets(rag_root: Path) -> List[Path]:
@@ -444,6 +450,23 @@ def collect_source_file_stats(args: argparse.Namespace, rag_root: Path) -> Tuple
     return sources, all_parquet_files
 
 
+def source_name_from_doc_id(doc_id: str) -> str:
+    did = str(doc_id)
+    if did.startswith("beir:"):
+        return "beir"
+    if did.startswith("msmarco:"):
+        return "ms_marco"
+    if did.startswith("hotpot:"):
+        return "hotpot_context"
+    if did.startswith("nq:"):
+        return "nq_qa"
+    if did.startswith("trivia:"):
+        return "trivia_qa"
+    if did.startswith("csqa:") or did.startswith("mmlu:") or did.startswith("agentar:"):
+        return "qa_corpora"
+    return "extra"
+
+
 def main() -> None:
     """
     主程序入口：
@@ -519,6 +542,60 @@ def main() -> None:
     pending_docs: List[Dict[str, str]] = []
     pending_texts: List[str] = []
     stop_requested = False
+    resumed = False
+    resumed_from_docs = 0
+
+    if args.resume_index and index_path.exists() and docs_path.exists():
+        print("[info] resume-index enabled, loading existing index/docs ...")
+        index = faiss.read_index(str(index_path))
+        resumed = True
+        resumed_from_docs = int(index.ntotal)
+        total_docs = resumed_from_docs
+
+        if meta_path.exists():
+            try:
+                prev_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                prev_counts = prev_meta.get("source_doc_counts", {})
+                if isinstance(prev_counts, dict):
+                    source_doc_counts = {str(k): int(v) for k, v in prev_counts.items()}
+            except Exception as e:
+                print(f"[warn] failed to load previous meta.json: {e}")
+
+        parsed_lines = 0
+        with docs_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parsed_lines += 1
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                did = str(row.get("doc_id", "")).strip()
+                if not did:
+                    continue
+                seen_ids.add(did)
+                if not source_doc_counts:
+                    src = source_name_from_doc_id(did)
+                    source_doc_counts[src] = source_doc_counts.get(src, 0) + 1
+
+        if parsed_lines != total_docs:
+            print(
+                f"[warn] docs lines ({parsed_lines}) != index.ntotal ({total_docs}), "
+                "resume may have partial mismatch"
+            )
+        if len(seen_ids) != parsed_lines:
+            print(
+                f"[warn] unique doc_ids ({len(seen_ids)}) < docs lines ({parsed_lines}), "
+                "duplicates were detected in existing docs.jsonl"
+            )
+        print(
+            f"[info] resume loaded: index_docs={total_docs}, "
+            f"seen_ids={len(seen_ids)}, source_counts_keys={sorted(source_doc_counts.keys())}"
+        )
+    elif args.resume_index:
+        print("[info] resume-index enabled but no existing complete checkpoint found, start from scratch")
 
     def build_meta(final: bool) -> Dict[str, object]:
         return {
@@ -538,6 +615,8 @@ def main() -> None:
             "checkpoint_every_docs": int(args.checkpoint_every_docs),
             "is_final": final,
             "build_sec": round(time.time() - t0, 2),
+            "resumed": resumed,
+            "resumed_from_docs": resumed_from_docs,
         }
 
     def write_checkpoint(final: bool) -> None:
@@ -556,7 +635,8 @@ def main() -> None:
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
-    with docs_path.open("w", encoding="utf-8") as docs_writer:
+    docs_mode = "a" if resumed else "w"
+    with docs_path.open(docs_mode, encoding="utf-8") as docs_writer:
         with torch.no_grad():
             def flush_pending() -> None:
                 nonlocal index, total_docs, encoded_batches, pending_docs, pending_texts
